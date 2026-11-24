@@ -444,11 +444,9 @@ function parseWithStatus (uri, opts) {
     }
 
     if (!schemeHandler || (schemeHandler && !schemeHandler.skipNormalize)) {
-      if (uri.indexOf('%') !== -1) {
-        if (parsed.scheme !== undefined) {
-          parsed.scheme = unescape(parsed.scheme)
-        }
-      }
+      // RFC 3986 section 3.1 does not allow percent-encoding in a scheme, so
+      // the scheme is never decoded. Decoding would let inert input such as
+      // `%6Aavascript:` become a live `javascript:` scheme.
       if (parsed.path) {
         parsed.path = normalizePathEncoding(parsed.path)
       }
