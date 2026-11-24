@@ -1,17 +1,22 @@
 'use strict'
 
-// Adapted from upstream fastify/fast-uri test/scheme-validation.test.js for a
-// tree without scheme validation. Upstream rejects percent-encoded schemes
-// with "URI scheme is malformed."; this version has no scheme validation, so
-// these tests assert what holds here instead: a percent-encoded scheme is
-// never decoded, never selects a scheme handler, and can not be normalized or
-// resolved into a live javascript:, data: or vbscript: scheme.
-
 const test = require('tape')
 const fastURI = require('..')
 
-// RFC 3986 section 3.1 does not allow percent-encoding in a scheme.
-const encodedSchemes = [
+const MALFORMED_SCHEME_ERROR = 'URI scheme is malformed.'
+
+const malformedSchemes = [
+  '%2f%2fevil.example:/pwn',
+  '%u002f%u002fevil.example:/pwn',
+  '%0d%0aSet-Cookie:%20sid=attacker:/p',
+  'foo%3Abar:value',
+  'foo%2Fbar:value',
+  '1http://example.com/',
+  'foo_bar:value',
+  'éxample:value',
+  'Kttp://example.com/',
+  'ſcheme:value',
+  // RFC 3986 section 3.1 does not allow percent-encoding in a scheme.
   '%4Aavascript:alert(1)',
   '%6aavascript:alert(1)',
   'foo%2Bbar:value',
@@ -21,22 +26,7 @@ const encodedSchemes = [
   '%64ata:text/html,x'
 ]
 
-const LIVE_SCHEME = /^(?:javascript|data|vbscript):/i
-
-// The scheme exactly as written in the input.
-function rawScheme (uri) {
-  return uri.slice(0, uri.indexOf(':'))
-}
-
-// The input with its scheme percent-decoded, i.e. what the vulnerable parser
-// turned it into.
-function decodedForm (uri) {
-  return unescape(rawScheme(uri)) + uri.slice(uri.indexOf(':'))
-}
-
-test('parse keeps valid schemes and never decodes an encoded scheme', (t) => {
-  // This tree does not lowercase the parsed scheme (upstream does that as
-  // part of scheme validation), so the scheme is compared case-insensitively.
+test('parse validates the decoded scheme against RFC 3986', (t) => {
   const validSchemes = [
     ['a:value', 'a'],
     ['HTTP://example.com/', 'http'],
@@ -47,13 +37,12 @@ test('parse keeps valid schemes and never decodes an encoded scheme', (t) => {
   for (const [uri, scheme] of validSchemes) {
     const parsed = fastURI.parse(uri)
     t.equal(parsed.error, undefined, uri)
-    t.equal(String(parsed.scheme).toLowerCase(), scheme, uri + ' scheme')
+    t.equal(parsed.scheme, scheme, uri + ' scheme')
   }
 
-  for (const uri of encodedSchemes) {
+  for (const uri of malformedSchemes) {
     const parsed = fastURI.parse(uri)
-    t.equal(parsed.scheme, rawScheme(uri), uri + ' scheme is not decoded')
-    t.notEqual(String(parsed.scheme).indexOf('%'), -1, uri + ' scheme keeps its percent escape')
+    t.equal(parsed.error, MALFORMED_SCHEME_ERROR, uri)
   }
   t.end()
 })
@@ -69,12 +58,7 @@ test('percent-encoded schemes do not select scheme handlers', (t) => {
   // verify that a percent-encoded scheme does not select its scheme handler
   const ws = fastURI.parse('w%73://example.com/a?b')
   t.equal(ws.resourceName, undefined, 'ws parsing does not run for an encoded scheme')
-  t.equal(ws.scheme, 'w%73', 'the encoded ws scheme is kept as-is')
-  t.equal(
-    fastURI.parse(fastURI.normalize('w%73://example.com/a?b')).resourceName,
-    undefined,
-    'normalization does not turn an encoded scheme into ws'
-  )
+  t.equal(ws.error, MALFORMED_SCHEME_ERROR)
   t.end()
 })
 
@@ -90,74 +74,90 @@ test('normalization cannot synthesize a scheme from encoded input', (t) => {
 
   for (const uri of inputs) {
     const parsed = fastURI.parse(uri)
-    t.notOk(LIVE_SCHEME.test(String(parsed.scheme) + ':'), uri + ' parsed scheme is not decoded')
-    const normalized = fastURI.normalize(uri)
-    t.notOk(LIVE_SCHEME.test(normalized), uri + ' does not normalize to a live scheme')
-    t.equal(normalized.indexOf(rawScheme(uri) + ':'), 0, uri + ' keeps its encoded scheme when normalized')
-    t.notOk(LIVE_SCHEME.test(fastURI.resolve('https://example.com/app/', uri)), uri + ' does not resolve to a live scheme')
+    t.equal(parsed.error, MALFORMED_SCHEME_ERROR, uri + ' is malformed')
+    t.notOk(/^(?:javascript|data|vbscript):/i.test(String(parsed.scheme) + ':'), uri + ' parsed scheme is not decoded')
+    t.equal(fastURI.normalize(uri), uri, uri + ' normalizes to itself')
+    t.equal(fastURI.equal(uri, uri), false, uri + ' is not comparable')
+    t.throws(() => fastURI.resolve('https://example.com/app/', uri), /URI scheme is malformed\./, uri + ' is rejected by resolve')
   }
 
   t.equal(fastURI.equal('%68ttp://a/', 'http://a/'), false, 'encoded scheme does not alias a plain scheme')
   t.end()
 })
 
-test('normalize preserves percent-encoded schemes', (t) => {
-  for (const uri of encodedSchemes) {
-    const normalized = fastURI.normalize(uri)
-    t.equal(normalized.indexOf(rawScheme(uri) + ':'), 0, uri)
-    t.equal(fastURI.parse(normalized).scheme, rawScheme(uri), uri + ' reparses to the encoded scheme')
+test('normalize preserves schemes that decode to invalid identifiers', (t) => {
+  for (const uri of malformedSchemes) {
+    t.equal(fastURI.normalize(uri), uri, uri)
   }
   t.end()
 })
 
-test('equal does not match an encoded scheme to its decoded form', (t) => {
-  for (const uri of encodedSchemes) {
-    t.equal(fastURI.equal(uri, decodedForm(uri), {}), false, uri)
+test('scheme normalization cannot introduce authority or control delimiters', (t) => {
+  const authority = '%2f%2fevil.example:/pwn'
+  const crlf = '%0d%0aSet-Cookie:%20sid=attacker:/p'
+
+  t.equal(fastURI.parse(authority).host, undefined, 'original input has no authority')
+  t.equal(fastURI.normalize(authority), authority, 'normalization does not create an authority')
+  t.equal(fastURI.normalize(crlf), crlf, 'normalization does not emit raw CRLF')
+  t.equal(fastURI.normalize(crlf).includes('\r\n'), false, 'normalized output contains no raw CRLF')
+  t.end()
+})
+
+test('equal returns false for malformed decoded schemes', (t) => {
+  for (const uri of malformedSchemes) {
+    t.equal(fastURI.equal(uri, uri, {}), false, uri)
   }
   t.end()
 })
 
-test('resolve keeps an encoded scheme in either input', (t) => {
-  t.equal(
-    fastURI.resolve('%6Aavascript:/base/', 'child'),
-    '%6Aavascript:/base/child',
-    'encoded base scheme'
+test('resolve rejects malformed decoded schemes in either input', (t) => {
+  t.throws(
+    () => fastURI.resolve('%2f%2fevil.example:/base', 'child'),
+    /URI scheme is malformed\./,
+    'malformed base'
   )
-  t.equal(
-    fastURI.resolve('https://allowed.example/app/', '%6Aavascript:alert(1)'),
-    '%6Aavascript:alert(1)',
-    'encoded relative reference scheme'
+  t.throws(
+    () => fastURI.resolve('https://allowed.example/app/', '%2f%2fevil.example:/pwn'),
+    /URI scheme is malformed\./,
+    'malformed relative reference'
   )
   t.end()
 })
 
-test('serialize and component normalization do not decode component schemes', (t) => {
+test('serialize validates component schemes without decoding them', (t) => {
   t.equal(
     fastURI.serialize({ scheme: 'foo+bar', path: 'value' }),
     'foo+bar:value',
     'valid scheme is serialized'
   )
-  t.equal(
-    fastURI.serialize({ scheme: 'foo%2Bbar', path: 'value' }),
-    'foo%2Bbar:value',
-    'percent-encoded scheme is serialized without decoding'
+  t.throws(
+    () => fastURI.serialize({ scheme: 'foo%2Bbar', path: 'value' }),
+    /URI scheme is malformed\./,
+    'percent-encoded scheme is rejected'
   )
-  t.notOk(
-    LIVE_SCHEME.test(fastURI.serialize({ scheme: '%6Aavascript', path: 'alert(1)' })),
-    'encoded scheme does not serialize as javascript:'
+  t.throws(
+    () => fastURI.serialize({ scheme: '%6Aavascript', path: 'alert(1)' }),
+    /URI scheme is malformed\./,
+    'encoded scheme cannot serialize as javascript:'
+  )
+  t.throws(
+    () => fastURI.serialize({ scheme: '//evil.example', path: '/pwn' }),
+    /URI scheme is malformed\./,
+    'raw invalid scheme'
+  )
+  t.throws(
+    () => fastURI.serialize({ scheme: '%2f%2fevil.example', path: '/pwn' }),
+    /URI scheme is malformed\./,
+    'encoded invalid scheme'
   )
   t.equal(
-    fastURI.normalize({ scheme: '%6Aavascript', path: 'alert(1)' }).scheme,
-    '%6Aavascript',
-    'normalizing a component does not decode its scheme'
-  )
-  t.equal(
-    fastURI.resolveComponent(
-      { scheme: 'https', host: 'allowed.example', path: '/app/' },
-      { scheme: '%6Aavascript', path: 'alert(1)' }
-    ).scheme,
-    '%6Aavascript',
-    'resolveComponent does not decode the reference scheme'
+    fastURI.equal(
+      { scheme: '%2f%2fevil.example', path: '/pwn' },
+      { scheme: '%2f%2fevil.example', path: '/pwn' },
+      {}
+    ),
+    false,
+    'equality fails closed for malformed component objects'
   )
   t.end()
 })

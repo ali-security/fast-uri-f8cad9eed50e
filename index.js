@@ -3,10 +3,29 @@
 const { normalizeIPv6, removeDotSegments, removeDotSegmentsRelative, escapeFirstSegmentColon, recomposeAuthority, normalizePercentEncoding, normalizePathEncoding, escapePreservingEscapes, reescapeHostDelimiters, isIPv4, nonSimpleDomain } = require('./lib/utils')
 const { SCHEMES, getSchemeHandler } = require('./lib/schemes')
 
+const VALID_SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*$/u
+const MALFORMED_SCHEME_ERROR = 'URI scheme is malformed.'
 const MALFORMED_HOST_ERROR = 'URI host is malformed.'
 // ASCII characters outside the RFC 3986 reg-name set (unreserved, sub-delims
 // and "%" for pct-encoded): C0 controls, space, DEL, and "#/:<>?@[\]^`{|}.
 const FORBIDDEN_DOMAIN_HOST_CHARACTER = /[\0-\x20"#/:<>?@[\\\]^`{|}\x7F]/u
+
+/**
+ * Require a scheme to be a valid RFC 3986 scheme. RFC 3986 section 3.1 does
+ * not allow percent-encoding in a scheme, so the scheme is validated as-is and
+ * never decoded. Decoding would let inert input such as `%6Aavascript:` become
+ * a live `javascript:` scheme, or `%2f%2f` become reserved delimiters.
+ *
+ * @param {string} scheme
+ * @returns {string}
+ */
+function validateScheme (scheme) {
+  const stringScheme = String(scheme)
+  if (!VALID_SCHEME.test(stringScheme)) {
+    throw new TypeError(MALFORMED_SCHEME_ERROR)
+  }
+  return stringScheme
+}
 
 /**
  * @template {import('./types/index').URIComponent|string} T
@@ -31,9 +50,9 @@ function normalize (uri, options) {
  */
 function resolve (baseURI, relativeURI, options) {
   const schemelessOptions = options ? Object.assign({ scheme: 'null' }, options) : { scheme: 'null' }
-  const { parsed: baseParsed, malformedAuthorityOrPort: baseMalformed, malformedHost: baseMalformedHost } = parseWithStatus(baseURI, schemelessOptions)
-  const { parsed: relativeParsed, malformedAuthorityOrPort: relativeMalformed, malformedHost: relativeMalformedHost } = parseWithStatus(relativeURI, schemelessOptions)
-  if (baseMalformed || relativeMalformed || baseMalformedHost || relativeMalformedHost) {
+  const { parsed: baseParsed, malformedAuthorityOrPort: baseMalformed, malformedHost: baseMalformedHost, malformedScheme: baseMalformedScheme } = parseWithStatus(baseURI, schemelessOptions)
+  const { parsed: relativeParsed, malformedAuthorityOrPort: relativeMalformed, malformedHost: relativeMalformedHost, malformedScheme: relativeMalformedScheme } = parseWithStatus(relativeURI, schemelessOptions)
+  if (baseMalformed || relativeMalformed || baseMalformedHost || relativeMalformedHost || baseMalformedScheme || relativeMalformedScheme) {
     throw new Error(baseParsed.error || relativeParsed.error || 'URI is malformed.')
   }
   const resolved = resolveComponent(baseParsed, relativeParsed, schemelessOptions, true)
@@ -172,6 +191,10 @@ function serialize (cmpts, opts) {
   const options = Object.assign({}, opts)
   const uriTokens = []
 
+  if (component.scheme) {
+    component.scheme = validateScheme(component.scheme)
+  }
+
   // find scheme handler
   const schemeHandler = getSchemeHandler(options.scheme || component.scheme)
 
@@ -203,6 +226,8 @@ function serialize (cmpts, opts) {
   }
 
   if (options.reference !== 'suffix' && component.scheme) {
+    // Scheme handlers may replace the scheme during serialization.
+    component.scheme = validateScheme(component.scheme)
     uriTokens.push(component.scheme, ':')
   }
 
@@ -394,7 +419,7 @@ function isHostOnlyURL (url) {
 /**
  * @param {string} uri
  * @param {import('./types/index').Options} [opts]
- * @returns {{ parsed: import('./types/index').URIComponent, malformedAuthorityOrPort: boolean }}
+ * @returns {{ parsed: import('./types/index').URIComponent, malformedAuthorityOrPort: boolean, malformedHost: boolean, malformedScheme: boolean }}
  */
 function parseWithStatus (uri, opts) {
   const options = Object.assign({}, opts)
@@ -412,6 +437,7 @@ function parseWithStatus (uri, opts) {
   let malformedAuthorityOrPort = false
   let malformedHost = false
   let malformedIPLiteral = false
+  let malformedScheme = false
 
   let isIP = false
   if (options.reference === 'suffix') {
@@ -468,6 +494,23 @@ function parseWithStatus (uri, opts) {
     parsed.path = matches[6] || ''
     parsed.query = matches[7]
     parsed.fragment = matches[8]
+
+    if (parsed.scheme !== undefined) {
+      // Require the scheme, exactly as written, to be a valid RFC 3986 scheme.
+      // The scheme selects the scheme handler and is emitted verbatim by
+      // serialize(), so an escaped "//", ":" or CRLF (e.g. "%2f%2f") must not
+      // be accepted as a scheme: once decoded downstream it would re-enter the
+      // URI as live syntax (host-allowlist bypass, header injection). Reject it
+      // instead of rewriting it, and only case-normalize a scheme that has
+      // already been validated -- lowercasing first would fold non-ASCII
+      // look-alikes (e.g. U+212A KELVIN SIGN) onto ASCII scheme names.
+      if (VALID_SCHEME.test(parsed.scheme)) {
+        parsed.scheme = parsed.scheme.toLowerCase()
+      } else {
+        parsed.error = parsed.error || MALFORMED_SCHEME_ERROR
+        malformedScheme = true
+      }
+    }
 
     // fix port number
     if (isNaN(parsed.port)) {
@@ -561,7 +604,7 @@ function parseWithStatus (uri, opts) {
   } else {
     parsed.error = parsed.error || 'URI can not be parsed.'
   }
-  return { parsed, malformedAuthorityOrPort, malformedHost }
+  return { parsed, malformedAuthorityOrPort, malformedHost, malformedScheme }
 }
 
 /**
@@ -585,14 +628,15 @@ function normalizeString (uri, opts) {
 /**
  * @param {string} uri
  * @param {import('./types/index').Options} [opts]
- * @returns {{ normalized: string, malformedAuthorityOrPort: boolean, malformedHost: boolean }}
+ * @returns {{ normalized: string, malformedAuthorityOrPort: boolean, malformedHost: boolean, malformedScheme: boolean }}
  */
 function normalizeStringWithStatus (uri, opts) {
-  const { parsed, malformedAuthorityOrPort, malformedHost } = parseWithStatus(uri, opts)
+  const { parsed, malformedAuthorityOrPort, malformedHost, malformedScheme } = parseWithStatus(uri, opts)
   return {
-    normalized: malformedAuthorityOrPort || malformedHost ? uri : serialize(parsed, opts),
+    normalized: malformedAuthorityOrPort || malformedHost || malformedScheme ? uri : serialize(parsed, opts),
     malformedAuthorityOrPort,
-    malformedHost
+    malformedHost,
+    malformedScheme
   }
 }
 
@@ -603,16 +647,16 @@ function normalizeStringWithStatus (uri, opts) {
  */
 function normalizeComparableURI (uri, opts) {
   if (typeof uri === 'string') {
-    const { normalized, malformedAuthorityOrPort, malformedHost } = normalizeStringWithStatus(uri, opts)
-    return malformedAuthorityOrPort || malformedHost ? undefined : normalized
+    const { normalized, malformedAuthorityOrPort, malformedHost, malformedScheme } = normalizeStringWithStatus(uri, opts)
+    return malformedAuthorityOrPort || malformedHost || malformedScheme ? undefined : normalized
   }
 
   if (typeof uri === 'object') {
     try {
       return serialize(uri, opts)
     } catch {
-      // A component that can not be serialized safely (e.g. a malformed port)
-      // can not be compared; fail closed.
+      // A component that can not be serialized safely (e.g. a malformed port
+      // or scheme) can not be compared; fail closed.
       return undefined
     }
   }
