@@ -1,6 +1,6 @@
 'use strict'
 
-const { normalizeIPv6, removeDotSegments, removeDotSegmentsRelative, recomposeAuthority, normalizePercentEncoding, normalizePathEncoding, escapePreservingEscapes, reescapeHostDelimiters, isIPv4, nonSimpleDomain } = require('./lib/utils')
+const { normalizeIPv6, removeDotSegments, removeDotSegmentsRelative, escapeFirstSegmentColon, recomposeAuthority, normalizePercentEncoding, normalizePathEncoding, escapePreservingEscapes, reescapeHostDelimiters, isIPv4, nonSimpleDomain } = require('./lib/utils')
 const { SCHEMES, getSchemeHandler } = require('./lib/schemes')
 
 const MALFORMED_HOST_ERROR = 'URI host is malformed.'
@@ -178,12 +178,24 @@ function serialize (cmpts, opts) {
   // perform scheme specific serialization
   if (schemeHandler && schemeHandler.serialize) schemeHandler.serialize(component, options)
 
+  const hasAuthority = component.userinfo !== undefined || component.host !== undefined || component.port !== undefined
+  // A reference with no emitted scheme is path-noscheme: a bare ':' in its
+  // first path segment would reparse as a scheme (RFC 3986 3.3/4.2). A suffix
+  // reference never emits its scheme token, so it is path-noscheme as well.
+  // Enforced under skipEscape too (resolve()), so the reapply below gates on
+  // this flag.
+  const schemelessReference = (!component.scheme || options.reference === 'suffix') && !hasAuthority
+  const pathNoScheme = !options.skipEscape && schemelessReference
+
   if (component.path !== undefined) {
     if (!options.skipEscape) {
       component.path = escapePreservingEscapes(component.path)
 
       if (component.scheme !== undefined) {
         component.path = component.path.split('%3A').join(':')
+      }
+      if (pathNoScheme) {
+        component.path = escapeFirstSegmentColon(component.path)
       }
     } else {
       component.path = normalizePercentEncoding(component.path)
@@ -214,9 +226,17 @@ function serialize (cmpts, opts) {
       // and must never become root-relative (RFC 3986 section 5.2.4 applies to
       // merged target paths, not to the reference itself). A reference with no
       // emitted scheme and no authority is such a relative-path reference.
-      s = (!component.scheme || options.reference === 'suffix') && authority === undefined && s[0] !== '/'
+      s = schemelessReference && s[0] !== '/'
         ? removeDotSegmentsRelative(s)
         : removeDotSegments(s)
+    }
+
+    // Dot-segment removal can expose a colon that was not originally in the
+    // first segment, and skipEscape or absolutePath can leave one raw. Reapply
+    // path-noscheme encoding so the serialized relative reference cannot be
+    // reparsed as a URI scheme.
+    if (schemelessReference) {
+      s = escapeFirstSegmentColon(s)
     }
 
     if (
