@@ -92,8 +92,8 @@ test('valid IPv6, IPvFuture, embedded IPv4, and zone forms normalize safely', (t
 
 test('unterminated bracket hosts are not treated as IP literals', (t) => {
   // An IP-literal is only an IP-literal when both brackets are present. A host
-  // with a single bracket must keep failing the reg-name/IDN conversion instead
-  // of being waved through as an already-canonical literal.
+  // with a single bracket must be rejected as a malformed host instead of being
+  // waved through as an already-canonical literal.
   const unterminated = [
     '[fe80',
     'fe80]',
@@ -126,9 +126,43 @@ test('unterminated bracket hosts are not treated as IP literals', (t) => {
     t.equal(fastURI.equal(uri, uri), false, `equal rejects ${uri}`)
     t.throws(
       () => fastURI.resolve(uri, 'child'),
-      /Host's domain name can not be converted to ASCII|URI path must start with/,
+      /URI host is malformed\.|URI path must start with/,
       `resolve rejects ${uri}`
     )
+  }
+  t.end()
+})
+
+test('hosts with unbalanced or misplaced IP-literal brackets are rejected', (t) => {
+  const malformed = [
+    'http://[fe80',
+    'http://[',
+    'http://[not-an-ip',
+    'http://[\u65e5\u672c',
+    'http://user@[@127.0.0.1:8123/admin',
+    'http://user@]127.0.0.1:8123/admin',
+    'http://user@prefix[@127.0.0.1:8123/admin',
+    'http://user@prefix]@127.0.0.1:8123/admin'
+  ]
+  const modes = [
+    ['default', undefined],
+    ['Unicode', { unicodeSupport: true }]
+  ]
+
+  for (const [mode, options] of modes) {
+    for (const uri of malformed) {
+      const parsed = fastURI.parse(uri, options)
+      const message = `${mode} mode rejects ${uri}`
+
+      t.equal(parsed.error, HOST_ERROR, `parse ${message}`)
+      t.equal(fastURI.normalize(uri, options), uri, `normalize preserves ${uri} in ${mode} mode`)
+      t.equal(fastURI.equal(uri, uri, options), false, `equal ${message}`)
+      t.throws(
+        () => fastURI.resolve('http://example.com/', uri, options),
+        /URI host is malformed\./,
+        `resolve ${message}`
+      )
+    }
   }
   t.end()
 })

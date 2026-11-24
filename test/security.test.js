@@ -482,3 +482,62 @@ test('CVE-2026-75899: host conversion failures are not treated as comparable URL
     'resolve propagates a host conversion failure'
   )
 })
+
+test('CVE-2026-75975: unterminated bracket hosts are rejected in resolve', (t) => {
+  t.plan(2)
+  t.throws(
+    () => fastURI.resolve('http://[fe80/', 'child'),
+    /URI host is malformed\./,
+    'an unterminated base host is not waved through as an IP literal'
+  )
+  t.throws(
+    () => fastURI.resolve('http://example.com/', '//[fe80/private'),
+    /URI host is malformed\./,
+    'an unterminated reference host is not waved through as an IP literal'
+  )
+})
+
+test('CVE-2026-84292: a misplaced IP-literal bracket can not move the authority to another host', (t) => {
+  const uri = 'http://user@[@127.0.0.1:8123/admin'
+  const modes = [
+    ['default', undefined],
+    ['Unicode', { unicodeSupport: true }]
+  ]
+
+  t.plan(modes.length * 4)
+
+  modes.forEach(([mode, options]) => {
+    const parsed = fastURI.parse(uri, options)
+    t.notEqual(parsed.host, '127.0.0.1', `${mode} mode parse does not yield host 127.0.0.1`)
+    t.equal(parsed.error, 'URI host is malformed.', `${mode} mode parse rejects the host`)
+    t.notEqual(
+      fastURI.parse(fastURI.normalize(uri, options), options).host,
+      '127.0.0.1',
+      `${mode} mode normalize does not reparse to host 127.0.0.1`
+    )
+    t.throws(
+      () => fastURI.resolve('http://trusted.example/', uri, options),
+      /URI host is malformed\./,
+      `${mode} mode resolve rejects the reference`
+    )
+  })
+})
+
+test('CVE-2026-84292: a component port can not inject a new authority', (t) => {
+  t.plan(3)
+  t.throws(
+    () => fastURI.serialize({ scheme: 'http', host: 'trusted.example', port: '@127.0.0.1:8124', path: '/app' }),
+    /URI port is malformed\./,
+    'serialize rejects a port carrying authority delimiters'
+  )
+  t.throws(
+    () => fastURI.resolveComponent({ scheme: 'http', host: 'trusted.example', port: '@127.0.0.1:8124' }, { path: 'app' }),
+    /URI port is malformed\./,
+    'resolveComponent rejects a base port carrying authority delimiters'
+  )
+  t.equal(
+    fastURI.equal({ scheme: 'http', host: 'trusted.example', port: '@127.0.0.1:8124' }, 'http://trusted.example:@127.0.0.1:8124/'),
+    false,
+    'equal does not match a URI whose authority host is 127.0.0.1'
+  )
+})

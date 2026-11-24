@@ -254,6 +254,18 @@ function getParseError (parsed, matches) {
 }
 
 /**
+ * Whether the host is a bracketed IP literal (RFC 3986 `IP-literal`).
+ * An unterminated `[` is not a literal, so it must still be validated as a
+ * reg-name instead of being waved through as an IP.
+ *
+ * @param {string} host
+ * @returns {boolean}
+ */
+function isIPLiteral (host) {
+  return host[0] === '[' && host[host.length - 1] === ']'
+}
+
+/**
  * Convert a Unicode IDN host to its ASCII form when the effective scheme uses
  * domain hosts and cannot handle IRIs. Sets parsed.error on failure.
  *
@@ -380,10 +392,11 @@ function parseWithStatus (uri, opts) {
     if (parsed.host) {
       const ipv4result = isIPv4(parsed.host)
       if (ipv4result === false) {
-        const bracketedIPLiteral = parsed.host[0] === '[' && parsed.host[parsed.host.length - 1] === ']'
+        const bracketedIPLiteral = isIPLiteral(parsed.host)
+        const hasIPLiteralBracket = parsed.host.indexOf('[') !== -1 || parsed.host.indexOf(']') !== -1
         const ipv6result = normalizeIPv6(parsed.host)
         isIP = ipv6result.isIPV6 || ipv6result.isIPVFuture === true
-        malformedIPLiteral = bracketedIPLiteral && ipv6result.error === true
+        malformedIPLiteral = hasIPLiteralBracket && (!bracketedIPLiteral || ipv6result.error === true)
         parsed.host = isIP ? ipv6result.host : ipv6result.host.toLowerCase()
 
         if (malformedIPLiteral) {
@@ -413,7 +426,9 @@ function parseWithStatus (uri, opts) {
     const schemeHandler = getSchemeHandler(options.scheme || parsed.scheme)
 
     // convert Unicode IDN -> ASCII IDN when the effective scheme uses domain hosts
-    malformedHost = canonicalizeHost(parsed, options, schemeHandler, isIP)
+    if (!malformedIPLiteral) {
+      malformedHost = canonicalizeHost(parsed, options, schemeHandler, isIP)
+    }
 
     if (uri.indexOf('%') !== -1 && parsed.host !== undefined && !malformedIPLiteral) {
       // Decode only current unreserved escapes, once. Using unescape() here
@@ -500,7 +515,13 @@ function normalizeComparableURI (uri, opts) {
   }
 
   if (typeof uri === 'object') {
-    return serialize(uri, opts)
+    try {
+      return serialize(uri, opts)
+    } catch {
+      // A component that can not be serialized safely (e.g. a malformed port)
+      // can not be compared; fail closed.
+      return undefined
+    }
   }
 }
 
